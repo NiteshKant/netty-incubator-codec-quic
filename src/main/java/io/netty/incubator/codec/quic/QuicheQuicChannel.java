@@ -16,6 +16,7 @@
 package io.netty.incubator.codec.quic;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.buffer.CompositeByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.AbstractChannel;
 import io.netty.channel.Channel;
@@ -80,21 +81,6 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
          * Normal read without FIN flag.
          */
         OK
-    }
-
-    enum StreamSendResult {
-        /**
-         * Nothing more to sent and no FIN flag
-         */
-        DONE,
-        /**
-         * FIN flag sent.
-         */
-        FIN,
-        /**
-         * No more space, need to retry
-         */
-        NO_SPACE
     }
 
     private static final class CloseData implements ChannelFutureListener {
@@ -893,20 +879,20 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
     }
 
     private boolean connectionSendSegments(int maxSegments) {
-        final int bufferSize = maxSegments * Quic.MAX_DATAGRAM_SIZE;
-
+        CompositeByteBuf compositeByteBuf = alloc().compositeDirectBuffer(maxSegments);
         long connAddr = connection.address();
         boolean packetWasWritten = false;
         int numSegments = 0;
 
-        ByteBuf out = alloc().directBuffer(bufferSize);
         int lastWritten = -1;
         for (;;) {
             boolean done;
+            ByteBuf out = alloc().directBuffer(Quic.MAX_DATAGRAM_SIZE);
             int writerIndex = out.writerIndex();
             int written = Quiche.quiche_conn_send(
                     connAddr, Quiche.memoryAddress(out) + writerIndex, out.writableBytes());
             if (written == 0) {
+                out.release();
                 // No need to create a new datagram packet. Just try again.
                 continue;
             }
@@ -917,63 +903,62 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
                 done = true;
                 pipeline().fireExceptionCaught(e);
             }
+
             if (done) {
                 // We need to write what we have build up so far before we break out of the loop or release the buffer
                 // if nothing is contained in there.
-                int readable = out.readableBytes();
+                int readable = compositeByteBuf.readableBytes();
                 if (readable != 0) {
                     if (lastWritten != -1 && readable > lastWritten) {
-                        parent().write(new SegmentedDatagramPacket(out, lastWritten, remote));
+                        parent().write(new SegmentedDatagramPacket(compositeByteBuf, lastWritten, remote));
                     } else {
-                        parent().write(new DatagramPacket(out, remote));
+                        parent().write(new DatagramPacket(compositeByteBuf, remote));
                     }
                     packetWasWritten = true;
                 } else {
-                    out.release();
+                    compositeByteBuf.release();
                 }
                 break;
             }
 
+            out.writerIndex(writerIndex + written);
             if (written < lastWritten) {
+                compositeByteBuf.addComponent(true, out);
                 // The write was smaller then the write before. This means we can write all together as the
                 // last segment can be smaller then the other segments.
-                out.writerIndex(writerIndex + written);
-                parent().write(new SegmentedDatagramPacket(out, lastWritten, remote));
+                parent().write(new SegmentedDatagramPacket(compositeByteBuf, lastWritten, remote));
                 packetWasWritten = true;
 
-                out = alloc().directBuffer(bufferSize);
+                compositeByteBuf = alloc().compositeDirectBuffer(maxSegments);
                 lastWritten = -1;
                 numSegments = 0;
                 continue;
             }
 
             if (lastWritten != -1 && lastWritten != written)  {
-                ByteBuf newOut = alloc().directBuffer(bufferSize);
-                newOut.writeBytes(out, out.writerIndex(), written);
-
                 // As the last write was smaller then this write we first need to write what we had before as
                 // a segment can never be bigger then the previous segment. After this we will try to build a new
                 // chain of segments for the writes to follow.
-                parent().write(new SegmentedDatagramPacket(out, lastWritten, remote));
+                parent().write(new SegmentedDatagramPacket(compositeByteBuf, lastWritten, remote));
+                compositeByteBuf = alloc().compositeDirectBuffer(maxSegments);
                 packetWasWritten = true;
 
-                out = newOut;
                 lastWritten = written;
                 numSegments = 0;
             } else {
-                out.writerIndex(writerIndex + written);
+                compositeByteBuf.addComponent(true, out);
                 lastWritten = written;
                 numSegments++;
             }
 
             // check if we either built the maximum number of segments for a write or if the ByteBuf is not writable
             // anymore. In this case lets write what we have and start a new chain of segments.
-            if (numSegments == maxSegments ||
-                    !out.isWritable()) {
-                parent().write(new SegmentedDatagramPacket(out, lastWritten, remote));
+            if (numSegments == maxSegments) {
+
+                parent().write(new SegmentedDatagramPacket(compositeByteBuf, lastWritten, remote));
                 packetWasWritten = true;
 
-                out = alloc().directBuffer(bufferSize);
+                compositeByteBuf = alloc().compositeDirectBuffer(maxSegments);
                 numSegments = 0;
                 lastWritten = -1;
             }
