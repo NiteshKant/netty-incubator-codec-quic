@@ -905,6 +905,9 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
             }
 
             if (done) {
+                // Release buffer as we were not able wo write anything into it.
+                out.release();
+
                 // We need to write what we have build up so far before we break out of the loop or release the buffer
                 // if nothing is contained in there.
                 int readable = compositeByteBuf.readableBytes();
@@ -946,10 +949,10 @@ final class QuicheQuicChannel extends AbstractChannel implements QuicChannel {
                 lastWritten = written;
                 numSegments = 0;
             } else {
-                compositeByteBuf.addComponent(true, out);
                 lastWritten = written;
                 numSegments++;
             }
+            compositeByteBuf.addComponent(true, out);
 
             // check if we either built the maximum number of segments for a write or if the ByteBuf is not writable
             // anymore. In this case lets write what we have and start a new chain of segments.
